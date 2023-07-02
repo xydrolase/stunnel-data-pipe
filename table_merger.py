@@ -9,10 +9,11 @@ from argparse import ArgumentParser
 import os.path
 import io
 from typing import Optional
+import tempfile
 
 import boto3
 import boto3.s3
-from mypy_boto3_s3.service_resource import S3ServiceResource
+from mypy_boto3_s3.service_resource import S3ServiceResource, _Bucket
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -22,9 +23,9 @@ def parse_args():
     parser.add_argument("--bucket", required=True, help="The name of the S3 bucket")
     parser.add_argument('-s', "--source-dir", default="raw_data",
                         help="The source data directory containing raw data.")
-    parser.add_argument("--target-dir", default="processed",
+    parser.add_argument('-t', "--target-dir", default="processed",
                         help="The target/destionation directory for processed (Parquet) data")
-    parser.add_argument("--date", type=date.isoformat,
+    parser.add_argument('-d', "--date", type=date.fromisoformat,
                         help="The ISO formatted date of data to be processed (e.g. '2023-06-10')")
     parser.add_argument('-p', "--profile", default="default", dest="aws_profile",
                         help="The name of the AWS profile to retrieve credentials.")
@@ -43,16 +44,37 @@ def load_arrow_table_from_key(s3: S3ServiceResource, bucket: str, key: str):
     return pa.ipc.open_file(io.BytesIO(obj.get()['Body'].read())).read_all()
 
 
+def find_last_process_timestamp(bucket: _Bucket, dir_name: str) -> Optional[int]:
+    success_files = sorted(
+        bucket.objects.filter(Prefix=os.path.join(dir_name, "SUCCESS_"), Delimiter="/"),
+        key=lambda x: -x.last_modified.timestamp())
+
+    if success_files:
+        return success_files[0].last_modified.timestamp()
+    else:
+        return None
+
+
+
+
 class ChunkedParquetWriter:
-    def __init__(self, filename, schema, row_group_size):
-        self._writer = pq.ParquetWriter(filename, schema)
+    def __init__(self, where, row_group_size):
+        """
+        :param where: Either the path of the output file, or a file-like object. 
+        """
+        self._writer: Optional[pq.ParquetWriter] = None
+
         self.row_group_size = row_group_size
         self.closed = False
+        self.where = where
 
         self._buffered_chunks = []
         self._buffer_size = 0
 
     def append_table(self, table: pa.Table):
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(self.where, table.schema)
+
         self._buffer_size += table.num_rows
         self._buffered_chunks.extend(table.to_batches())
 
@@ -69,7 +91,7 @@ class ChunkedParquetWriter:
         self._buffered_chunks = []
 
     def close(self):
-        if not self.closed:
+        if not self.closed and self._writer:
             self._flush()
             self._writer.close()
     
@@ -82,21 +104,40 @@ def main():
     date_str = datetime.strftime(args.date, "%Y/%m/%d")
 
     bucket = s3.Bucket(args.bucket)
-    writer: Optional[ChunkedParquetWriter] = None
+    parquet_file = tempfile.NamedTemporaryFile(suffix=".parquet", mode="w+b", delete=False)
+    writer = ChunkedParquetWriter(parquet_file, args.record_batch_size)
 
-    for i, obj in enumerate(bucket.objects.filter(Prefix=os.path.join(args.source_dir, date_str))):
-        print(f"Loading {obj.key}")
+    output_dir = os.path.join(args.target_dir, date_str)
+    last_processed = find_last_process_timestamp(bucket, output_dir)
 
-        table = load_arrow_table_from_key(s3, args.bucket, obj.key)
-        if writer is None:
-            writer = ChunkedParquetWriter("/tmp/concat.parquet", table.schema, args.record_batch_size)
+    # sort all qualified files by last modified time so that the data written to the table are ordered
+    data_files = sorted(
+        [
+            (obj.key, obj.last_modified.timestamp())
+            for obj in bucket.objects.filter(Prefix=os.path.join(args.source_dir, date_str))
+            if not last_processed or obj.last_modified.timestamp() > last_processed
+        ], key=lambda x: x[1])
 
+    for key, _ in data_files:
+        print(f"Loading {key}")
+
+        table = load_arrow_table_from_key(s3, args.bucket, key)
         writer.append_table(table)
 
-        if i > 10:
-          break
-
     writer.close()
+    print(f"Closing {parquet_file.name}")
+    parquet_file.close()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    merged_key = os.path.join(output_dir, f"merged_{timestamp}.parquet")
+    s3.meta.client.upload_file(parquet_file.name, args.bucket, merged_key)
+    print(f"File uploaded to S3: s3://{args.bucket}/{merged_key}")
+
+    # create the SUCCESS file with empty bucket
+    bucket.put_object(Key=os.path.join(output_dir, f"SUCCESS_{timestamp}"), Body=b'')
+
+    # delete the local file
+    # os.unlink(parquet_file.name)
 
 if __name__ == "__main__":
     main()
